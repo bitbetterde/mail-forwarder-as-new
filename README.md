@@ -1,6 +1,6 @@
-# Mail Forwarder
+# Mail Forwarder (as New)
 
-A Node.js application that automatically forwards emails from one email account to another using IMAP and SMTP protocols.
+A Node.js application that automatically forwards emails from one email account to another using IMAP and SMTP protocols (as a new mail). This allows us to forward emails to a single mail address, which is whitelisted at an external provider. This way, we can just forward mails to a common address instead of adding the whitelisted address to every client.
 
 ## Features
 
@@ -60,5 +60,5 @@ npm start
 Or run directly with Node.js:
 
 ```bash
-node src/forward.ts
+node --experimental-strip-types src/forward.ts
 ```

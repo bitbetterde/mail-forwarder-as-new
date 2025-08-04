@@ -25,6 +25,8 @@ USER mailforwarder
 
 # Set environment to production
 ENV NODE_ENV=production
+ENV NPM_CONFIG_UPDATE_NOTIFIER=false
+ENV NPM_CONFIG_FUND=false
 
 # Run the application using the Docker-specific script
 CMD ["npm", "run", "start:docker"]
