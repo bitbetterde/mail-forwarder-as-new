@@ -1,0 +1,20 @@
+{
+  "name": "mail-forwarder-as-new",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "forward.js",
+  "license": "MIT",
+  "author": "Moritz Stückler <moritz@bitbetter.de>",
+  "scripts": {
+    "start": "node --experimental-strip-types --env-file=.env src/forward.ts",
+    "start:docker": "node --experimental-strip-types src/forward.ts"
+  },
+  "dependencies": {
+    "imapflow": "^1.0.193",
+    "mailparser": "^3.7.4",
+    "nodemailer": "^7.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.2.0"
+  }
+}
