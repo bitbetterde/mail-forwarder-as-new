@@ -16,6 +16,9 @@ const {
   ALLOWED_SENDER_DOMAINS,
 } = process.env;
 
+const DAEMON = (process.env.DAEMON || '').toLowerCase() === 'true';
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 60000);
+
 function validateEnvironmentVariables() {
   const requiredVars = [
     "IMAP_HOST",
@@ -137,86 +140,144 @@ async function forwardMail(email) {
   }
 }
 
+async function processUnseen(client: ImapFlow) {
+  console.log("Starting to process unseen messages...");
+  
+  // Ensure INBOX is open
+  if (!client.mailbox || client.mailbox.path !== 'INBOX') {
+    console.log("Opening INBOX...");
+    await client.mailboxOpen('INBOX');
+  }
+
+  console.log("Searching for unseen messages...");
+  // Fetch all unseen at once to avoid deadlocks
+  const messages = await client.fetchAll({ seen: false }, { uid: true, envelope: true, source: true });
+  
+  console.log(`Found ${messages.length} unseen messages`);
+
+  if (messages.length === 0) {
+    console.log("No unseen messages to process");
+    return;
+  }
+
+  for (const msg of messages) {
+    console.log(`Processing message UID: ${msg.uid}`);
+    try {
+      const parsed = await simpleParser(msg.source as Buffer);
+      console.log(`Parsed email with subject: ${parsed.subject || '(no subject)'}`);
+
+      if (!shouldForwardEmail(parsed)) {
+        console.log("Skipping email due to domain filter. Marking as seen...");
+        await client.messageFlagsAdd({ uid: msg.uid }, ['\\Seen']);
+        console.log("Email marked as seen successfully");
+        continue;
+      }
+
+      console.log("Email passed domain filter, forwarding...");
+      await forwardMail({
+        subject: parsed.subject || '(no subject)',
+        text: parsed.text || '',
+        html: parsed.html || undefined,
+        attachments: (parsed.attachments || []).map(a => ({ filename: a.filename, content: a.content })),
+      });
+
+      console.log("Deleting email after successful forward...");
+      // Delete only after successful forward
+      await client.messageDelete({ uid: msg.uid });
+      console.log("Email deleted successfully");
+    } catch (err) {
+      console.error('Processing failed for UID', msg.uid, err);
+      // Leave message untouched for retry
+    }
+  }
+  
+  console.log("Finished processing all unseen messages");
+}
+
 async function main() {
+  console.log("Starting mail forwarder application...");
+  
   // Validate all required environment variables are set
   validateEnvironmentVariables();
 
+  console.log("Creating IMAP client...");
   const client = new ImapFlow({
     host: IMAP_HOST!,
     port: parseInt(IMAP_PORT!, 10),
     secure: true,
-    auth: {
-      user: IMAP_USER!,
-      pass: IMAP_PASSWORD!,
-    },
-    logger: customLogger
+    auth: { user: IMAP_USER!, pass: IMAP_PASSWORD! },
+    logger: false // Disable ImapFlow logging completely
   });
 
   try {
+    console.log("Connecting to IMAP server...");
     await client.connect();
+    console.log("Connected successfully");
+    
+    console.log("Opening INBOX...");
+    await client.mailboxOpen('INBOX');
+    console.log("INBOX opened successfully");
 
-    // Select and lock the mailbox in read-write mode.
-    let lock = await client.getMailboxLock("INBOX", { readOnly: false });
-    try {
-      console.log("Searching for unseen messages...");
-      // Fetch all unseen messages at once to avoid deadlock with flag operations
-      const messages = await client.fetchAll(
-        { seen: false },
-        { source: true, uid: true }
-      );
-      
-      console.log(`Found ${messages.length} unseen message(s)`);
-      
-      for (const message of messages) {
-        const parsed = await simpleParser(message.source);
-        console.log("Found unread message:", parsed.subject);
-        
-        // Check if email should be forwarded based on sender domain
-        if (!shouldForwardEmail(parsed)) {
-          console.log("Skipping email due to domain filter. Marking as seen...");
-          try {
-            await client.messageFlagsAdd(message.uid, ["\\Seen"]);
-            console.log("Email marked as seen (filtered)");
-          } catch (flagError) {
-            console.error("Failed to mark filtered email as seen:", flagError.message);
-          }
-          continue;
+    // Initial batch
+    console.log("Starting initial message processing...");
+    await processUnseen(client);
+    console.log("Initial processing complete");
+
+    if (DAEMON) {
+      console.log(`Daemon mode enabled. Polling every ${POLL_INTERVAL_MS} ms`);
+      let busy = false;
+
+      const poll = async () => {
+        if (busy) {
+          console.log("Previous poll still running, skipping...");
+          return;
         }
-        
-        try {
-          await forwardMail(parsed);
-          // Delete the message after successful forwarding
-          console.log("Deleting forwarded email...");
-          try {
-            await client.messageDelete(message.uid);
-            console.log("Email deleted successfully");
-          } catch (deleteError) {
-            console.error("Failed to delete email:", deleteError.message);
-            // If deletion fails, mark as seen as fallback
-            try {
-              await client.messageFlagsAdd(message.uid, ["\\Seen"]);
-              console.log("Email marked as seen as fallback");
-            } catch (flagError) {
-              console.error("Failed to mark email as seen:", flagError.message);
-            }
-          }
-        } catch (error) {
-          console.error("Skipping email due to forwarding error. Email will remain unread for retry.");
-          // Don't delete or mark as seen so it can be retried later
+        busy = true;
+        console.log("Starting scheduled poll...");
+        try { 
+          await processUnseen(client); 
+          console.log("Scheduled poll complete");
         }
-      }
-      console.log("Finished processing all unseen messages");
-    } finally {
-      lock.release();
+        catch (e) { 
+          console.error('Polling error', e); 
+        }
+        finally { 
+          busy = false; 
+        }
+      };
+
+      const timer = setInterval(poll, POLL_INTERVAL_MS);
+
+      const shutdown = async (code = 0) => {
+        console.log("Shutting down daemon...");
+        clearInterval(timer);
+        try { await client.logout(); } catch {}
+        process.exit(code);
+      };
+      process.on('SIGTERM', () => shutdown(0));
+      process.on('SIGINT', () => shutdown(0));
+
+      // Keep process alive
+      console.log("Daemon running. Press Ctrl+C to stop.");
+      await new Promise(() => {}); // This keeps the process alive indefinitely
+    } else {
+      console.log("Non-daemon mode, logging out...");
+      await client.logout();
+      console.log("Logged out, exiting...");
+      process.exit(0);
     }
-
-    await client.logout();
-    console.log("Mail forwarding completed successfully.");
-    process.exit(0);
-  } catch (err) {
-    console.error("IMAP error:", err);
+  } catch (error) {
+    console.error("Error in main function:", error);
+    try {
+      await client.logout();
+    } catch (logoutError) {
+      console.error("Error during logout:", logoutError);
+    }
     process.exit(1);
   }
 }
 
-main();
+main().catch(err => {
+  console.error('Unexpected error in main:', err);
+  process.exit(1);
+});
