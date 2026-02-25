@@ -181,9 +181,11 @@ async function processUnseen(client: ImapFlow) {
         attachments: (parsed.attachments || []).map(a => ({ filename: a.filename, content: a.content })),
       });
 
+      // Mark as seen immediately so a failed delete doesn't cause re-processing
+      await client.messageFlagsAdd({ uid: msg.uid }, ['\\Seen'], { uid: true });
+
       console.log("Deleting email after successful forward...");
-      // Delete only after successful forward
-      await client.messageDelete({ uid: msg.uid });
+      await client.messageDelete({ uid: msg.uid }, { uid: true });
       console.log("Email deleted successfully");
     } catch (err) {
       console.error('Processing failed for UID', msg.uid, err);
