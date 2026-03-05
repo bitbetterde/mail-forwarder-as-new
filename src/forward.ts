@@ -16,6 +16,8 @@ const {
   ALLOWED_SENDER_DOMAINS,
 } = process.env;
 
+const PROCESSED_FOLDER = process.env.PROCESSED_FOLDER || 'Forwarded';
+
 const DAEMON = (process.env.DAEMON || '').toLowerCase() === 'true';
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 60000);
 
@@ -181,12 +183,12 @@ async function processUnseen(client: ImapFlow) {
         attachments: (parsed.attachments || []).map(a => ({ filename: a.filename, content: a.content })),
       });
 
-      // Mark as seen immediately so a failed delete doesn't cause re-processing
+      // Mark as seen immediately so a failed move doesn't cause re-processing
       await client.messageFlagsAdd({ uid: msg.uid }, ['\\Seen'], { uid: true });
 
-      console.log("Deleting email after successful forward...");
-      await client.messageDelete({ uid: msg.uid }, { uid: true });
-      console.log("Email deleted successfully");
+      console.log(`Moving email to ${PROCESSED_FOLDER}...`);
+      await client.messageMove({ uid: msg.uid }, PROCESSED_FOLDER, { uid: true });
+      console.log("Email moved successfully");
     } catch (err) {
       console.error('Processing failed for UID', msg.uid, err);
       // Leave message untouched for retry
@@ -219,6 +221,13 @@ async function main() {
     console.log("Opening INBOX...");
     await client.mailboxOpen('INBOX');
     console.log("INBOX opened successfully");
+
+    // Ensure processed folder exists
+    const existing = await client.list();
+    if (!existing.some(m => m.path === PROCESSED_FOLDER)) {
+      console.log(`Creating folder: ${PROCESSED_FOLDER}`);
+      await client.mailboxCreate(PROCESSED_FOLDER);
+    }
 
     // Initial batch
     console.log("Starting initial message processing...");
