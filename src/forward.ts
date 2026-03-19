@@ -21,6 +21,27 @@ const PROCESSED_FOLDER = process.env.PROCESSED_FOLDER || 'Forwarded';
 const DAEMON = (process.env.DAEMON || '').toLowerCase() === 'true';
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 60000);
 
+const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 } as const;
+type LogLevel = keyof typeof LOG_LEVELS;
+
+const configuredLevel = (process.env.LOG_LEVEL?.toLowerCase() ?? 'info') as LogLevel;
+const currentLogLevel = LOG_LEVELS[configuredLevel] ?? LOG_LEVELS.info;
+
+const logger = {
+  error: (msg: string, ...args: any[]) => {
+    if (currentLogLevel >= LOG_LEVELS.error) console.error(`[ERROR] ${msg}`, ...args);
+  },
+  warn: (msg: string, ...args: any[]) => {
+    if (currentLogLevel >= LOG_LEVELS.warn) console.warn(`[WARN]  ${msg}`, ...args);
+  },
+  info: (msg: string, ...args: any[]) => {
+    if (currentLogLevel >= LOG_LEVELS.info) console.log(`[INFO]  ${msg}`, ...args);
+  },
+  debug: (msg: string, ...args: any[]) => {
+    if (currentLogLevel >= LOG_LEVELS.debug) console.log(`[DEBUG] ${msg}`, ...args);
+  },
+};
+
 function validateEnvironmentVariables() {
   const requiredVars = [
     "IMAP_HOST",
@@ -38,45 +59,20 @@ function validateEnvironmentVariables() {
   const missingVars = requiredVars.filter((varName) => !process.env[varName]);
 
   if (missingVars.length > 0) {
-    console.error(
-      "Missing required environment variables:",
-      missingVars.join(", ")
-    );
+    logger.error("Missing required environment variables: " + missingVars.join(", "));
     process.exit(1);
   }
 
-  console.log("All required environment variables are set.");
-  
-  // Log domain filtering configuration
+  logger.debug("All required environment variables are set.");
+
   if (ALLOWED_SENDER_DOMAINS) {
-    console.log("Domain filtering enabled. Allowed domains:", ALLOWED_SENDER_DOMAINS);
+    logger.info("Domain filtering enabled. Allowed domains: " + ALLOWED_SENDER_DOMAINS);
   } else {
-    console.log("Domain filtering disabled. All emails will be forwarded.");
+    logger.debug("Domain filtering disabled. All emails will be forwarded.");
   }
 }
 
-// Custom logger for ImapFlow using console statements
-const customLogger = {
-  trace: () => {}, // Suppress trace logs
-  debug: () => {}, // Suppress debug logs
-  info: (msg: any, ...args: any[]) => {
-    // Only log important info messages
-    if (typeof msg === 'string' && (msg.includes('Connected') || msg.includes('Authenticated'))) {
-      console.log('IMAP:', msg, ...args);
-    }
-  },
-  warn: (msg: any, ...args: any[]) => {
-    console.warn('IMAP Warning:', msg, ...args);
-  },
-  error: (msg: any, ...args: any[]) => {
-    console.error('IMAP Error:', msg, ...args);
-  },
-  fatal: (msg: any, ...args: any[]) => {
-    console.error('IMAP Fatal:', msg, ...args);
-  }
-};
-
-function shouldForwardEmail(email) {
+function shouldForwardEmail(email: import('mailparser').ParsedMail) {
   // If no domain filtering is configured, forward all emails
   if (!ALLOWED_SENDER_DOMAINS) {
     return true;
@@ -86,15 +82,15 @@ function shouldForwardEmail(email) {
   const fromAddress = email.from?.value?.[0]?.address || email.from?.text || '';
   
   if (!fromAddress) {
-    console.log("No sender address found, skipping email");
+    logger.debug("No sender address found, skipping email");
     return false;
   }
 
   // Extract domain from sender email
   const senderDomain = fromAddress.split('@')[1]?.toLowerCase();
-  
+
   if (!senderDomain) {
-    console.log("Invalid sender email format:", fromAddress);
+    logger.warn(`Invalid sender email format: ${fromAddress}`);
     return false;
   }
 
@@ -105,15 +101,22 @@ function shouldForwardEmail(email) {
     .filter(domain => domain.length > 0);
 
   const isAllowed = allowedDomains.includes(senderDomain);
-  
+
   if (!isAllowed) {
-    console.log(`Email from ${fromAddress} (domain: ${senderDomain}) not in allowed domains: ${allowedDomains.join(', ')}`);
+    logger.info(`Skipping email from ${fromAddress} — domain not in allowlist: ${allowedDomains.join(', ')}`);
   }
 
   return isAllowed;
 }
 
-async function forwardMail(email) {
+interface MailToForward {
+  subject: string;
+  text: string;
+  html: string | undefined;
+  attachments: { filename: string | undefined; content: Buffer }[];
+}
+
+async function forwardMail(email: MailToForward) {
   const transporter = nodemailer.createTransport({
     host: SMTP_HOST!,
     port: parseInt(SMTP_PORT!, 10),
@@ -135,132 +138,116 @@ async function forwardMail(email) {
 
   try {
     await transporter.sendMail(mailOptions);
-    console.log("Forwarded email:", email.subject);
+    logger.info(`Forwarded email: ${email.subject}`);
   } catch (error) {
-    console.error("Failed to forward email:", email.subject, "Error:", error.message);
+    logger.error(`Failed to forward email: ${email.subject} — ${error instanceof Error ? error.message : error}`);
     throw error; // Re-throw to let the caller decide how to handle
   }
 }
 
 async function processUnseen(client: ImapFlow) {
-  console.log("Starting to process unseen messages...");
-  
+  logger.debug("Checking for unseen messages...");
+
   // Ensure INBOX is open
   if (!client.mailbox || client.mailbox.path !== 'INBOX') {
-    console.log("Opening INBOX...");
+    logger.debug("Opening INBOX...");
     await client.mailboxOpen('INBOX');
   }
 
-  console.log("Searching for unseen messages...");
   // Fetch all unseen at once to avoid deadlocks
   const messages = await client.fetchAll({ seen: false }, { uid: true, envelope: true, source: true });
-  
-  console.log(`Found ${messages.length} unseen messages`);
 
   if (messages.length === 0) {
-    console.log("No unseen messages to process");
+    logger.debug("No unseen messages to process");
     return;
   }
 
+  logger.info(`Found ${messages.length} unseen message(s)`);
+
   for (const msg of messages) {
-    console.log(`Processing message UID: ${msg.uid}`);
+    logger.debug(`Processing message UID: ${msg.uid}`);
     try {
       const parsed = await simpleParser(msg.source as Buffer);
-      console.log(`Parsed email with subject: ${parsed.subject || '(no subject)'}`);
+      logger.debug(`Parsed subject: ${parsed.subject || '(no subject)'}`);
 
       if (!shouldForwardEmail(parsed)) {
-        console.log("Skipping email due to domain filter. Marking as seen...");
+        logger.debug(`Domain filter: marking UID ${msg.uid} as seen and skipping`);
         await client.messageFlagsAdd({ uid: msg.uid }, ['\\Seen']);
-        console.log("Email marked as seen successfully");
         continue;
       }
 
-      console.log("Email passed domain filter, forwarding...");
       await forwardMail({
         subject: parsed.subject || '(no subject)',
         text: parsed.text || '',
-        html: parsed.html || undefined,
-        attachments: (parsed.attachments || []).map(a => ({ filename: a.filename, content: a.content })),
+        html: parsed.html || undefined, // normalize false/null → undefined
+        attachments: (parsed.attachments || []).map((a: import('mailparser').Attachment) => ({ filename: a.filename, content: a.content })),
       });
 
       // Mark as seen immediately so a failed move doesn't cause re-processing
       await client.messageFlagsAdd({ uid: msg.uid }, ['\\Seen'], { uid: true });
 
-      console.log(`Moving email to ${PROCESSED_FOLDER}...`);
+      logger.debug(`Moving UID ${msg.uid} to ${PROCESSED_FOLDER}...`);
       await client.messageMove({ uid: msg.uid }, PROCESSED_FOLDER, { uid: true });
-      console.log("Email moved successfully");
     } catch (err) {
-      console.error('Processing failed for UID', msg.uid, err);
+      logger.error(`Processing failed for UID ${msg.uid}: ${err}`);
       // Leave message untouched for retry
     }
   }
-  
-  console.log("Finished processing all unseen messages");
 }
 
 async function main() {
-  console.log("Starting mail forwarder application...");
-  
-  // Validate all required environment variables are set
+  logger.info("Starting mail forwarder...");
+
   validateEnvironmentVariables();
 
-  console.log("Creating IMAP client...");
   const client = new ImapFlow({
     host: IMAP_HOST!,
     port: parseInt(IMAP_PORT!, 10),
     secure: true,
     auth: { user: IMAP_USER!, pass: IMAP_PASSWORD! },
-    logger: false // Disable ImapFlow logging completely
+    logger: false,
   });
 
   try {
-    console.log("Connecting to IMAP server...");
+    logger.debug("Connecting to IMAP server...");
     await client.connect();
-    console.log("Connected successfully");
-    
-    console.log("Opening INBOX...");
+    logger.info("Connected to IMAP server");
+
+    logger.debug("Opening INBOX...");
     await client.mailboxOpen('INBOX');
-    console.log("INBOX opened successfully");
 
     // Ensure processed folder exists
     const existing = await client.list();
     if (!existing.some(m => m.path === PROCESSED_FOLDER)) {
-      console.log(`Creating folder: ${PROCESSED_FOLDER}`);
+      logger.info(`Creating folder: ${PROCESSED_FOLDER}`);
       await client.mailboxCreate(PROCESSED_FOLDER);
     }
 
-    // Initial batch
-    console.log("Starting initial message processing...");
     await processUnseen(client);
-    console.log("Initial processing complete");
 
     if (DAEMON) {
-      console.log(`Daemon mode enabled. Polling every ${POLL_INTERVAL_MS} ms`);
+      logger.info(`Daemon mode: polling every ${POLL_INTERVAL_MS} ms`);
       let busy = false;
 
       const poll = async () => {
         if (busy) {
-          console.log("Previous poll still running, skipping...");
+          logger.debug("Previous poll still running, skipping");
           return;
         }
         busy = true;
-        console.log("Starting scheduled poll...");
-        try { 
-          await processUnseen(client); 
-          console.log("Scheduled poll complete");
-        }
-        catch (e) { 
-          console.error('Polling error', e); 
-        }
-        finally { 
-          busy = false; 
+        try {
+          await processUnseen(client);
+        } catch (e) {
+          logger.error(`Polling error: ${e}`);
+        } finally {
+          busy = false;
         }
       };
 
       const timer = setInterval(poll, POLL_INTERVAL_MS);
 
       const shutdown = async (code = 0) => {
-        console.log("Shutting down daemon...");
+        logger.info("Shutting down...");
         clearInterval(timer);
         try { await client.logout(); } catch {}
         process.exit(code);
@@ -268,27 +255,20 @@ async function main() {
       process.on('SIGTERM', () => shutdown(0));
       process.on('SIGINT', () => shutdown(0));
 
-      // Keep process alive
-      console.log("Daemon running. Press Ctrl+C to stop.");
-      await new Promise(() => {}); // This keeps the process alive indefinitely
+      logger.info("Daemon running. Press Ctrl+C to stop.");
+      await new Promise(() => {}); // Keep process alive
     } else {
-      console.log("Non-daemon mode, logging out...");
       await client.logout();
-      console.log("Logged out, exiting...");
       process.exit(0);
     }
   } catch (error) {
-    console.error("Error in main function:", error);
-    try {
-      await client.logout();
-    } catch (logoutError) {
-      console.error("Error during logout:", logoutError);
-    }
+    logger.error(`Fatal error: ${error}`);
+    try { await client.logout(); } catch {}
     process.exit(1);
   }
 }
 
 main().catch(err => {
-  console.error('Unexpected error in main:', err);
+  logger.error(`Unexpected error: ${err}`);
   process.exit(1);
 });
