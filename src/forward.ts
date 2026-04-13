@@ -195,34 +195,41 @@ async function processUnseen(client: ImapFlow) {
   }
 }
 
-async function main() {
-  logger.info("Starting mail forwarder...");
-
-  validateEnvironmentVariables();
-
-  const client = new ImapFlow({
+function createClient() {
+  return new ImapFlow({
     host: IMAP_HOST!,
     port: parseInt(IMAP_PORT!, 10),
     secure: true,
     auth: { user: IMAP_USER!, pass: IMAP_PASSWORD! },
     logger: false,
   });
+}
+
+async function connectClient(client: ImapFlow) {
+  logger.debug("Connecting to IMAP server...");
+  await client.connect();
+  logger.info("Connected to IMAP server");
+
+  logger.debug("Opening INBOX...");
+  await client.mailboxOpen('INBOX');
+
+  // Ensure processed folder exists
+  const existing = await client.list();
+  if (!existing.some(m => m.path === PROCESSED_FOLDER)) {
+    logger.info(`Creating folder: ${PROCESSED_FOLDER}`);
+    await client.mailboxCreate(PROCESSED_FOLDER);
+  }
+}
+
+async function main() {
+  logger.info("Starting mail forwarder...");
+
+  validateEnvironmentVariables();
+
+  let client = createClient();
 
   try {
-    logger.debug("Connecting to IMAP server...");
-    await client.connect();
-    logger.info("Connected to IMAP server");
-
-    logger.debug("Opening INBOX...");
-    await client.mailboxOpen('INBOX');
-
-    // Ensure processed folder exists
-    const existing = await client.list();
-    if (!existing.some(m => m.path === PROCESSED_FOLDER)) {
-      logger.info(`Creating folder: ${PROCESSED_FOLDER}`);
-      await client.mailboxCreate(PROCESSED_FOLDER);
-    }
-
+    await connectClient(client);
     await processUnseen(client);
 
     if (DAEMON) {
@@ -239,6 +246,11 @@ async function main() {
           await processUnseen(client);
         } catch (e) {
           logger.error(`Polling error: ${e}`);
+          logger.info("Reconnecting to IMAP server...");
+          try { await client.logout(); } catch {}
+          client = createClient();
+          await connectClient(client);
+          logger.info("Reconnected successfully");
         } finally {
           busy = false;
         }
